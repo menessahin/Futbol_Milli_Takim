@@ -199,6 +199,7 @@ POSITIONS = {
         "abbr": "KAL",
         "formation_slot": "gk",
         "eligible": ["Keeper"],
+        "candidates": ["Altay Bayındır", "Muhammed Şengezer", "Okan Kocuk", "Uğurcan Çakir"],
         "metrics": {
             "goalkeeping__save_percentage": ("Kurtarış %", 0.30),
             "goalkeeping__goals_prevented": ("Önlenen Gol", 0.25),
@@ -211,6 +212,7 @@ POSITIONS = {
         "abbr": "RST",
         "formation_slot": "rcb",
         "eligible": ["Center Back"],
+        "candidates": ["Merih Demiral", "Ozan Kabak", "Samet Akaydin"],
         "metrics": {
             "defending__interceptions": ("Top Kapma", 0.23),
             "defending__tackles": ("Müdahale", 0.19),
@@ -224,6 +226,7 @@ POSITIONS = {
         "abbr": "LST",
         "formation_slot": "lcb",
         "eligible": ["Center Back"],
+        "candidates": ["Emirhan Topçu", "Abdülkerim Bardakci", "Adil Demirbağ"],
         "metrics": {
             "defending__interceptions": ("Top Kapma", 0.23),
             "defending__tackles": ("Müdahale", 0.19),
@@ -237,6 +240,7 @@ POSITIONS = {
         "abbr": "SBK",
         "formation_slot": "rb",
         "eligible": ["Right Wing-Back", "Right Back", "Center Back"],
+        "candidates": ["Zeki Çelik"],
         "metrics": {
             "defending__tackles": ("Müdahale", 0.28),
             "defending__interceptions": ("Top Kapma", 0.24),
@@ -248,6 +252,7 @@ POSITIONS = {
         "abbr": "LBK",
         "formation_slot": "lb",
         "eligible": ["Left Back", "Left Wing-Back"],
+        "candidates": ["Eren Elmalı", "Ferdi Kadıoğlu"],
         "metrics": {
             "passing__xa": ("Beklenen Asist", 0.31),
             "defending__tackles": ("Müdahale", 0.23),
@@ -259,6 +264,7 @@ POSITIONS = {
         "abbr": "6",
         "formation_slot": "dm1",
         "eligible": ["Defensive Midfielder"],
+        "candidates": ["Ismail Yüksek", "Melih Kabasakal", "Salih Özcan"],
         "metrics": {
             "defending__interceptions": ("Top Kapma", 0.31),
             "defending__tackles": ("Müdahale", 0.28),
@@ -270,6 +276,7 @@ POSITIONS = {
         "abbr": "8",
         "formation_slot": "dm2",
         "eligible": ["Defensive Midfielder", "Attacking Midfielder"],
+        "candidates": ["Orkun Kökcü", "Demir Tıknaz", "Bartuğ Elmaz"],
         "metrics": {
             "passing__xa": ("Beklenen Asist", 0.25),
             "passing__chances_created": ("Fırsat Yaratma", 0.20),
@@ -282,6 +289,7 @@ POSITIONS = {
         "abbr": "LW",
         "formation_slot": "lw",
         "eligible": ["Left Winger", "Attacking Midfielder", "Left Back"],
+        "candidates": ["Aral Şimşir", "İlhan Fakılı"],
         "metrics": {
             "shooting__xg": ("Beklenen Gol", 0.25),
             "passing__xa": ("Beklenen Asist", 0.25),
@@ -294,6 +302,7 @@ POSITIONS = {
         "abbr": "10",
         "formation_slot": "am",
         "eligible": ["Attacking Midfielder", "Defensive Midfielder"],
+        "candidates": ["Arda Güler", "Can Uzun"],
         "metrics": {
             "passing__xa": ("Beklenen Asist", 0.30),
             "passing__chances_created": ("Fırsat Yaratma", 0.30),
@@ -305,6 +314,7 @@ POSITIONS = {
         "abbr": "RW",
         "formation_slot": "rw",
         "eligible": ["Right Winger", "Attacking Midfielder", "Right Wing-Back"],
+        "candidates": ["Yunus Akgün", "Oğuz Aydın", "İrfan Kahveci"],
         "metrics": {
             "shooting__xg": ("Beklenen Gol", 0.25),
             "passing__xa": ("Beklenen Asist", 0.20),
@@ -317,6 +327,7 @@ POSITIONS = {
         "abbr": "FW",
         "formation_slot": "st",
         "eligible": ["Striker", "Attacking Midfielder", "Left Winger", "Right Winger"],
+        "candidates": ["Kerem Aktürkoglu", "Barış Alper Yılmaz", "Deniz Gül"],
         "metrics": {
             "shooting__xg": ("Beklenen Gol", 0.30),
             "shooting__goals": ("Gol", 0.25),
@@ -346,7 +357,9 @@ def compute_score(player_row, metrics_weights):
     return round(score * 100, 1)
 
 def get_best_player(pos_name, pos_config, weights_override, used_names, norm_df):
-    eligible = norm_df[norm_df['position_primary'].isin(pos_config['eligible'])].copy()
+    # Aday havuzu artık geniş pozisyon kategorisine değil, elle atanmış oyuncu
+    # listesine (candidates) göre belirleniyor — bkz. proje notu.
+    eligible = norm_df[norm_df['name'].isin(pos_config['candidates'])].copy()
     eligible = eligible[~eligible['name'].isin(used_names)]
     if eligible.empty:
         return None, 0
@@ -404,7 +417,7 @@ with left_col:
         pos_config = POSITIONS[pos_name]
 
         with st.expander(f"**{pos_name}** — {pos_config['abbr']}", expanded=False):
-            st.caption(f"Uygun pozisyonlar: {', '.join(pos_config['eligible'])}")
+            st.caption(f"Aday havuzu: {', '.join(pos_config['candidates'])}")
 
             weights_override = {}
             metrics_list = list(pos_config['metrics'].items())
