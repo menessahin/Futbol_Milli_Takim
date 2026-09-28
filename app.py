@@ -10,6 +10,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Barlow+Condensed:wght@600;700&display=swap');
@@ -31,6 +32,7 @@ h1, h2, h3 { font-family: 'Barlow Condensed', sans-serif; letter-spacing: 0.5px;
 .pos-card {
     background: #111827; border: 1px solid #1e2d4a; border-radius: 8px;
     padding: 1rem; margin-bottom: 0.75rem; transition: border-color 0.2s;
+    display: flex; justify-content: space-between; align-items: center;
 }
 .pos-card:hover { border-color: #e63946; }
 .pos-card-title { font-family: 'Barlow Condensed', sans-serif; font-size: 1.1rem; font-weight: 600; color: #e63946; margin-bottom: 0.25rem; }
@@ -39,17 +41,13 @@ h1, h2, h3 { font-family: 'Barlow Condensed', sans-serif; letter-spacing: 0.5px;
 .score-badge {
     background: #e63946; color: white;
     font-family: 'Barlow Condensed', sans-serif; font-size: 1.4rem; font-weight: 700;
-    padding: 0.3rem 0.8rem; border-radius: 4px; float: right;
+    padding: 0.3rem 0.8rem; border-radius: 4px;
 }
-
 .stSlider > div > div > div { background: #e63946 !important; }
 .stTabs [data-baseweb="tab-list"] { background: #111827; border-radius: 8px; }
 .stTabs [data-baseweb="tab"] { color: #6b7fa3; }
 .stTabs [aria-selected="true"] { color: #e63946 !important; }
 .streamlit-expanderHeader { background: #111827 !important; color: #e8eaf0 !important; border-radius: 6px; }
-.stDataFrame { background: #111827; }
-[data-testid="stMetricValue"] { color: #e63946; font-family: 'Barlow Condensed', sans-serif; font-size: 2rem !important; }
-
 .section-title {
     font-family: 'Barlow Condensed', sans-serif; font-size: 1.4rem; font-weight: 700;
     color: #8899bb; text-transform: uppercase; letter-spacing: 1.5px;
@@ -70,364 +68,244 @@ def load_data():
 
 df = load_data()
 
-NEG_COLS = {'defending__dribbled_past', 'defending__fouls_committed', 'goalkeeping__error_led_to_goal'}
+# ── SKOR METODOLOJİSİ ────────────────────────────────────────────────────────
+# pct_rank sütunları 0-100 arasında ligteki yüzdelik dilimi verir.
+# Bu değerleri direkt kullanıyoruz (zaten normalize edilmiş).
+# Ek olarak main_rating'i form skoru olarak ekliyoruz (%15 ağırlıkla).
+# goals_prevented negatif olabileceği için özel sign-aware normalizasyon uygulanır.
 
-def minmax_normalize(series):
+def get_pct(df, col, player_name):
+    """pct_rank sütunundan oyuncunun değerini al (0-100). Yoksa 50 ver."""
+    pct_col = f"{col}__pct_rank"
+    row = df[df['name'] == player_name]
+    if row.empty or pct_col not in df.columns:
+        return 50.0
+    val = row[pct_col].values[0]
+    return float(val) if pd.notna(val) else 50.0
+
+def get_form_score(df, player_name):
+    """main_rating'i 0-100 skalasına çevir. FotMob rating 5-9 arası."""
+    row = df[df['name'] == player_name]
+    if row.empty:
+        return 50.0
+    rating = row['main_rating'].values[0]
+    if pd.isna(rating):
+        return 50.0
+    # FotMob: 5.0 (min) → 9.0 (max) → 0-100 skalası
+    normalized = (float(rating) - 5.0) / (9.0 - 5.0) * 100.0
+    return max(0.0, min(100.0, normalized))
+
+def get_goals_prevented_score(df, player_name):
+    """
+    goals_prevented negatif olabilir (kötü kaleci → gol izni verir).
+    Tüm takımlar içinde min-max normalize et, sonra 0-100'e çevir.
+    """
+    col = 'goalkeeping__goals_prevented'
+    if col not in df.columns:
+        return 50.0
+    series = df[col].dropna()
+    if series.empty:
+        return 50.0
     mn, mx = series.min(), series.max()
+    row = df[df['name'] == player_name]
+    if row.empty:
+        return 50.0
+    val = row[col].values[0]
+    if pd.isna(val):
+        return 50.0
     if mx == mn:
-        return pd.Series([0.5] * len(series), index=series.index)
-    return (series - mn) / (mx - mn)
+        return 50.0
+    return float((val - mn) / (mx - mn) * 100.0)
 
-def normalize_inverse(series):
-    return 1 - minmax_normalize(series)
+def compute_composite_score(player_name, metrics_weights, form_weight=0.15):
+    """
+    Her metrik için pct_rank kullanarak ağırlıklı kompozit skor hesapla.
+    form_weight: main_rating'in toplam skordaki payı.
+    Kalan (1-form_weight) metrik ağırlıklarına dağıtılır.
+    """
+    form_score = get_form_score(df, player_name)
 
-def local_normalize(df_raw, candidate_names, metric_cols):
-    subset = df_raw[df_raw['name'].isin(candidate_names)].copy()
-    norm = pd.DataFrame()
-    norm['name'] = subset['name'].values
+    metric_score = 0.0
+    total_metric_w = sum(w for _, w in metrics_weights.values())
 
-    for col in metric_cols:
-        if col not in df_raw.columns:
-            norm[col] = 0.5
-            continue
-        series = subset[col].fillna(subset[col].median() if subset[col].notna().any() else 0.5)
-        if col in NEG_COLS:
-            norm[col] = normalize_inverse(series).values
-        else:
-            norm[col] = minmax_normalize(series).values
-
-    for meta in ['team', 'league', 'position_primary', 'age']:
-        if meta in df_raw.columns:
-            norm[meta] = subset[meta].values
-
-    return norm.reset_index(drop=True)
-
-def compute_score(player_row, metrics_weights):
-    score = 0.0
     for col, (label, w) in metrics_weights.items():
-        val = player_row.get(col, 0.5)
-        if pd.isna(val):
-            val = 0.5
-        score += val * w
-    return round(score * 100, 1)
+        if total_metric_w == 0:
+            normalized_w = 0
+        else:
+            normalized_w = w / total_metric_w
 
-def compute_all_scores(pos_name, pos_config, weights_override, df_raw):
-    candidate_names = pos_config['candidates']
-    metric_cols = list(pos_config['metrics'].keys())
+        if col == 'goalkeeping__goals_prevented':
+            pct = get_goals_prevented_score(df, player_name)
+        else:
+            pct = get_pct(df, col, player_name)
 
-    local_norm = local_normalize(df_raw, candidate_names, metric_cols)
+        metric_score += pct * normalized_w
 
-    metrics = {}
-    for col, (label, default_w) in pos_config['metrics'].items():
-        metrics[col] = (label, weights_override.get(col, default_w))
-    total_w = sum(w for _, w in metrics.values())
-    if total_w > 0:
-        metrics = {col: (lbl, w / total_w) for col, (lbl, w) in metrics.items()}
+    # Form ağırlığı karıştır
+    final = metric_score * (1 - form_weight) + form_score * form_weight
+    return round(final, 1)
 
-    scores = []
-    for _, row in local_norm.iterrows():
-        s = compute_score(row, metrics)
-        scores.append({
-            'name': row['name'],
-            'score': s,
-            'team': row.get('team', '—'),
-            'league': row.get('league', '—'),
-            'position_primary': row.get('position_primary', '—'),
-        })
-
-    scores.sort(key=lambda x: x['score'], reverse=True)
-    return scores
-
-# ── SCIPY'SİZ HUNGARIAN ALGORİTMASI ─────────────────────────────────────────
-def _hungarian(cost_matrix):
-    """
-    Saf numpy ile Hungarian (Macar) algoritması.
-    scipy.optimize.linear_sum_assignment ile aynı sonucu verir.
-    Minimize eder — maximize için negatif matris ver.
-    """
-    C = cost_matrix.copy().astype(float)
-    n, m = C.shape
-    size = max(n, m)
-
-    # Kare matrise pad et
-    C_sq = np.full((size, size), np.max(C[C < 1e5]) * 2 if np.any(C < 1e5) else 1000.0)
-    C_sq[:n, :m] = C
-
-    # Adım 1: satır minimumlarını çıkar
-    C_sq -= C_sq.min(axis=1, keepdims=True)
-    # Adım 2: sütun minimumlarını çıkar
-    C_sq -= C_sq.min(axis=0, keepdims=True)
-
-    row_covered = np.zeros(size, dtype=bool)
-    col_covered = np.zeros(size, dtype=bool)
-    assignment = np.full(size, -1, dtype=int)  # assignment[row] = col
-
-    def find_zeros():
-        zeros = []
-        for r in range(size):
-            for c in range(size):
-                if abs(C_sq[r, c]) < 1e-9:
-                    zeros.append((r, c))
-        return zeros
-
-    for _ in range(size * size):
-        # Atanmamış sıfırları bul ve ata
-        row_assigned = np.zeros(size, dtype=bool)
-        col_assigned = np.zeros(size, dtype=bool)
-        assignment = np.full(size, -1, dtype=int)
-
-        zeros = find_zeros()
-        # Önce tek seçenekli satırları ata
-        for r in range(size):
-            row_zeros = [c for (rr, c) in zeros if rr == r]
-            if len(row_zeros) == 1:
-                c = row_zeros[0]
-                if not col_assigned[c]:
-                    assignment[r] = c
-                    row_assigned[r] = True
-                    col_assigned[c] = True
-
-        # Kalan sıfırları ata
-        for r, c in zeros:
-            if not row_assigned[r] and not col_assigned[c]:
-                assignment[r] = c
-                row_assigned[r] = True
-                col_assigned[c] = True
-
-        assigned_count = np.sum(assignment >= 0)
-        if assigned_count == size:
-            break
-
-        # Minimum satır sayısı ile tüm sıfırları örtecek çizgi seti bul
-        # (Basitleştirilmiş: örtülmemiş minimum değeri güncelle)
-        marked_rows = set()
-        marked_cols = set()
-
-        for r in range(size):
-            if assignment[r] < 0:
-                marked_rows.add(r)
-
-        changed = True
-        while changed:
-            changed = False
-            for r in marked_rows:
-                for rr, c in zeros:
-                    if rr == r and c not in marked_cols:
-                        marked_cols.add(c)
-                        changed = True
-            for c in marked_cols:
-                for r in range(size):
-                    if assignment[r] == c and r not in marked_rows:
-                        marked_rows.add(r)
-                        changed = True
-
-        covered_rows = set(range(size)) - marked_rows
-        covered_cols = marked_cols
-
-        uncovered_vals = [
-            C_sq[r, c]
-            for r in range(size) for c in range(size)
-            if r not in covered_rows and c not in covered_cols
-        ]
-        if not uncovered_vals:
-            break
-        mn = min(uncovered_vals)
-
-        for r in range(size):
-            for c in range(size):
-                if r not in covered_rows and c not in covered_cols:
-                    C_sq[r, c] -= mn
-                elif r in covered_rows and c in covered_cols:
-                    C_sq[r, c] += mn
-
-    # Orijinal boyuta kırp
-    valid = [(r, assignment[r]) for r in range(size)
-             if assignment[r] >= 0 and r < n and assignment[r] < m]
-    if not valid:
-        return [], []
-    row_ind, col_ind = zip(*valid)
-    return list(row_ind), list(col_ind)
-
-
-# ── GLOBAL OPTİMİZASYON ─────────────────────────────────────────────────────
-def optimize_lineup(positions, formation_order, weights_by_pos, df_raw):
-    pos_names = formation_order
-    player_pool = list(dict.fromkeys(
-        p for pn in pos_names for p in positions[pn]['candidates']
-    ))
-
-    n_pos = len(pos_names)
-    n_players = len(player_pool)
-
-    pos_scores_matrix = np.full((n_pos, n_players), -1.0)
-    all_scores = {}
-
-    for i, pos_name in enumerate(pos_names):
-        pos_config = positions[pos_name]
-        weights_override = weights_by_pos.get(pos_name, {})
-        candidate_scores = compute_all_scores(pos_name, pos_config, weights_override, df_raw)
-        score_map = {d['name']: d for d in candidate_scores}
-        all_scores[pos_name] = candidate_scores
-
-        for j, player_name in enumerate(player_pool):
-            if player_name in score_map:
-                pos_scores_matrix[i][j] = score_map[player_name]['score']
-
-    # Maximize için negatif, uygun olmayan için büyük pozitif ceza
-    cost_matrix = np.where(pos_scores_matrix >= 0, -pos_scores_matrix, 1e6)
-    row_ind, col_ind = _hungarian(cost_matrix)
-
-    lineup = {}
-    for i, j in zip(row_ind, col_ind):
-        if pos_scores_matrix[i][j] >= 0:
-            player_name = player_pool[j]
-            pos_name = pos_names[i]
-            score_detail = next(
-                (d for d in all_scores[pos_name] if d['name'] == player_name),
-                {'name': player_name, 'score': 0, 'team': '—', 'league': '—', 'position_primary': '—'}
-            )
-            lineup[pos_name] = score_detail
-
-    return lineup, all_scores
-
-
-# ── POZİSYONLAR ──────────────────────────────────────────────────────────────
+# ── FORMASYON & POZİSYON TANIMI ──────────────────────────────────────────────
 POSITIONS = {
     "Kaleci": {
-        "abbr": "KAL", "formation_slot": "gk", "eligible": ["Keeper"],
-        "candidates": ["Altay Bayındır","Muhammed Şengezer","Okan Kocuk","Uğurcan Çakir"],
+        "abbr": "KAL",
+        "candidates": ["Altay Bayındır", "Muhammed Şengezer", "Okan Kocuk", "Uğurcan Çakir"],
         "metrics": {
-            "goalkeeping__save_percentage": ("Kurtarış %", 0.30),
-            "goalkeeping__goals_prevented": ("Önlenen Gol", 0.25),
-            "goalkeeping__clean_sheets":    ("Gol Yememe", 0.20),
-            "distribution__pass_accuracy":  ("Pas İsabeti", 0.15),
-            "goalkeeping__high_claims":     ("Hava Topu", 0.10),
+            # Metrik: (Türkçe etiket, ağırlık)
+            # Kaynak: Apunts (2024) kaleci indeksi + Wyscout GK modeli
+            "goalkeeping__save_percentage":    ("Kurtarış %",        0.30),
+            "goalkeeping__goals_prevented":    ("Önlenen Gol",       0.25),
+            "goalkeeping__clean_sheets":       ("Gol Yememe",        0.18),
+            "goalkeeping__high_claims":        ("Hava Topu",         0.12),
+            "distribution__pass_accuracy":     ("Pas İsabeti",       0.15),
         }
     },
     "Sağ Stoper": {
-        "abbr": "RST", "formation_slot": "rcb", "eligible": ["Center Back"],
-        "candidates": ["Merih Demiral","Ozan Kabak","Samet Akaydin"],
+        "abbr": "RST",
+        "candidates": ["Merih Demiral", "Ozan Kabak", "Samet Akaydin"],
         "metrics": {
-            "defending__interceptions":   ("Top Kapma", 0.23),
-            "defending__tackles":         ("Müdahale", 0.19),
-            "possession__aerials_won_pct":("Hava Topu %", 0.19),
-            "defending__clearances":      ("Uzaklaştırma", 0.16),
-            "defending__recoveries":      ("Top Kazanma", 0.13),
-            "passing__pass_accuracy":     ("Pas İsabeti", 0.10),
+            "defending__interceptions":              ("Top Kapma",        0.20),
+            "defending__tackles":                    ("Müdahale",         0.18),
+            "possession__aerials_won_pct":           ("Hava Topu %",      0.18),
+            "defending__clearances":                 ("Uzaklaştırma",     0.14),
+            "defending__recoveries":                 ("Top Kazanma",      0.12),
+            "defending__blocked_scoring_attempt":    ("Şut Blok",         0.08),
+            "passing__pass_accuracy":                ("Pas İsabeti",      0.10),
         }
     },
     "Sol Stoper": {
-        "abbr": "LST", "formation_slot": "lcb", "eligible": ["Center Back"],
-        "candidates": ["Emirhan Topçu","Abdülkerim Bardakci","Adil Demirbağ"],
+        "abbr": "LST",
+        "candidates": ["Emirhan Topçu", "Abdülkerim Bardakci", "Adil Demirbağ"],
         "metrics": {
-            "defending__interceptions":   ("Top Kapma", 0.23),
-            "defending__tackles":         ("Müdahale", 0.19),
-            "possession__aerials_won_pct":("Hava Topu %", 0.19),
-            "defending__clearances":      ("Uzaklaştırma", 0.16),
-            "defending__recoveries":      ("Top Kazanma", 0.13),
-            "passing__pass_accuracy":     ("Pas İsabeti", 0.10),
+            "defending__interceptions":              ("Top Kapma",        0.20),
+            "defending__tackles":                    ("Müdahale",         0.18),
+            "possession__aerials_won_pct":           ("Hava Topu %",      0.18),
+            "defending__clearances":                 ("Uzaklaştırma",     0.14),
+            "defending__recoveries":                 ("Top Kazanma",      0.12),
+            "defending__blocked_scoring_attempt":    ("Şut Blok",         0.08),
+            "passing__pass_accuracy":                ("Pas İsabeti",      0.10),
         }
     },
     "Sağ Bek": {
-        "abbr": "SBK", "formation_slot": "rb",
-        "eligible": ["Right Wing-Back","Right Back","Center Back"],
+        "abbr": "SBK",
         "candidates": ["Zeki Çelik"],
         "metrics": {
-            "defending__tackles":        ("Müdahale", 0.28),
-            "defending__interceptions":  ("Top Kapma", 0.24),
-            "passing__xa":               ("Beklenen Asist", 0.24),
-            "possession__duels_won_pct": ("İkili Kazanma %", 0.24),
+            "defending__tackles":              ("Müdahale",             0.25),
+            "defending__interceptions":        ("Top Kapma",            0.22),
+            "passing__xa":                     ("Beklenen Asist",       0.20),
+            "passing__cross_accuracy":         ("Orta İsabeti",         0.18),
+            "possession__duels_won_pct":       ("İkili Kazanma %",      0.15),
         }
     },
     "Sol Bek": {
-        "abbr": "LBK", "formation_slot": "lb",
-        "eligible": ["Left Back","Left Wing-Back"],
-        "candidates": ["Eren Elmalı","Ferdi Kadıoğlu"],
+        "abbr": "LBK",
+        "candidates": ["Eren Elmalı", "Ferdi Kadıoğlu"],
         "metrics": {
-            "passing__xa":               ("Beklenen Asist", 0.31),
-            "defending__tackles":        ("Müdahale", 0.23),
-            "defending__interceptions":  ("Top Kapma", 0.23),
-            "possession__duels_won_pct": ("İkili Kazanma %", 0.23),
+            "passing__xa":                     ("Beklenen Asist",       0.28),
+            "passing__cross_accuracy":         ("Orta İsabeti",         0.18),
+            "defending__tackles":              ("Müdahale",             0.20),
+            "defending__interceptions":        ("Top Kapma",            0.18),
+            "possession__duels_won_pct":       ("İkili Kazanma %",      0.16),
         }
     },
     "6 Numara": {
-        "abbr": "6", "formation_slot": "dm1", "eligible": ["Defensive Midfielder"],
-        "candidates": ["Ismail Yüksek","Melih Kabasakal","Salih Özcan"],
+        "abbr": "6",
+        "candidates": ["Ismail Yüksek", "Melih Kabasakal", "Salih Özcan"],
         "metrics": {
-            "defending__interceptions":  ("Top Kapma", 0.31),
-            "defending__tackles":        ("Müdahale", 0.28),
-            "passing__pass_accuracy":    ("Pas İsabeti", 0.24),
-            "possession__duels_won_pct": ("İkili Kazanma %", 0.17),
+            "defending__interceptions":              ("Top Kapma",        0.28),
+            "defending__tackles":                    ("Müdahale",         0.25),
+            "passing__pass_accuracy":                ("Pas İsabeti",      0.22),
+            "defending__possession_won_final_3rd":   ("Son Üçte Kazanma", 0.15),
+            "possession__duels_won_pct":             ("İkili Kazanma %",  0.10),
         }
     },
     "8 Numara": {
-        "abbr": "8", "formation_slot": "dm2",
-        "eligible": ["Defensive Midfielder","Attacking Midfielder"],
-        "candidates": ["Orkun Kökcü","Demir Tıknaz","Bartuğ Elmaz"],
+        "abbr": "8",
+        "candidates": ["Orkun Kökcü", "Demir Tıknaz", "Bartuğ Elmaz"],
         "metrics": {
-            "passing__xa":                           ("Beklenen Asist", 0.25),
-            "passing__chances_created":              ("Fırsat Yaratma", 0.20),
-            "shooting__xg":                          ("Beklenen Gol", 0.20),
-            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
-            "defending__tackles":                    ("Müdahale", 0.15),
-        }
-    },
-    "Sol Açık": {
-        "abbr": "LW", "formation_slot": "lw",
-        "eligible": ["Left Winger","Attacking Midfielder","Left Back"],
-        "candidates": ["Aral Şimşir","İlhan Fakılı","Barış Alper Yılmaz","Kerem Aktürkoglu","Can Uzun","Yunus Akgün"],
-        "metrics": {
-            "shooting__xg":                          ("Beklenen Gol", 0.25),
-            "passing__xa":                           ("Beklenen Asist", 0.25),
-            "possession__dribbles_success_rate":     ("Dribling %", 0.20),
-            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
-            "shooting__shots_on_target":             ("İsabetli Şut", 0.10),
-        }
-    },
-    "10 Numara": {
-        "abbr": "10", "formation_slot": "am",
-        "eligible": ["Attacking Midfielder","Defensive Midfielder"],
-        "candidates": ["Arda Güler","Can Uzun","İrfan Kahveci","Yunus Akgün"],
-        "metrics": {
-            "passing__xa":                           ("Beklenen Asist", 0.30),
-            "passing__chances_created":              ("Fırsat Yaratma", 0.30),
-            "shooting__xg":                          ("Beklenen Gol", 0.20),
-            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
+            "passing__xa":                               ("Beklenen Asist",      0.22),
+            "passing__chances_created":                  ("Fırsat Yaratma",      0.20),
+            "passing__line-breaking_passes":             ("Hat Kıran Pas",       0.18),
+            "shooting__xg":                              ("Beklenen Gol",        0.18),
+            "possession__touches_in_opposition_box":     ("Rakip Ceza Dokunuş",  0.12),
+            "defending__tackles":                        ("Müdahale",            0.10),
         }
     },
     "Sağ Açık": {
-        "abbr": "RW", "formation_slot": "rw",
-        "eligible": ["Right Winger","Attacking Midfielder","Right Wing-Back"],
-        "candidates": ["Yunus Akgün","Oğuz Aydın","İrfan Kahveci","Barış Alper Yılmaz"],
+        "abbr": "RW",
+        "candidates": ["Yunus Akgün", "Oğuz Aydın", "İrfan Kahveci"],
         "metrics": {
-            "shooting__xg":                          ("Beklenen Gol", 0.25),
-            "passing__xa":                           ("Beklenen Asist", 0.20),
-            "possession__dribbles_success_rate":     ("Dribling %", 0.20),
-            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
-            "shooting__shots_on_target":             ("İsabetli Şut", 0.15),
+            "shooting__xg":                              ("Beklenen Gol",        0.25),
+            "passing__xa":                               ("Beklenen Asist",      0.20),
+            "possession__dribbles_success_rate":         ("Dribling %",          0.20),
+            "possession__touches_in_opposition_box":     ("Rakip Ceza Dokunuş",  0.18),
+            "shooting__shots_on_target":                 ("İsabetli Şut",        0.17),
+        }
+    },
+    "10 Numara": {
+        "abbr": "10",
+        "candidates": ["Arda Güler", "Can Uzun"],
+        "metrics": {
+            "passing__xa":                               ("Beklenen Asist",      0.28),
+            "passing__chances_created":                  ("Fırsat Yaratma",      0.25),
+            "passing__big_chances_created":              ("Büyük Fırsat",        0.18),
+            "shooting__xg":                              ("Beklenen Gol",        0.17),
+            "possession__touches_in_opposition_box":     ("Rakip Ceza Dokunuş",  0.12),
+        }
+    },
+    "Sol Açık": {
+        "abbr": "LW",
+        "candidates": ["Aral Şimşir", "İlhan Fakılı"],
+        "metrics": {
+            "shooting__xg":                              ("Beklenen Gol",        0.25),
+            "passing__xa":                               ("Beklenen Asist",      0.22),
+            "possession__dribbles_success_rate":         ("Dribling %",          0.20),
+            "possession__touches_in_opposition_box":     ("Rakip Ceza Dokunuş",  0.18),
+            "shooting__shots_on_target":                 ("İsabetli Şut",        0.15),
         }
     },
     "Forvet": {
-        "abbr": "FW", "formation_slot": "st",
-        "eligible": ["Striker","Attacking Midfielder","Left Winger","Right Winger"],
-        "candidates": ["Kerem Aktürkoglu","Barış Alper Yılmaz","Deniz Gül"],
+        "abbr": "FW",
+        "candidates": ["Kerem Aktürkoglu", "Barış Alper Yılmaz", "Deniz Gül"],
         "metrics": {
-            "shooting__xg":                          ("Beklenen Gol", 0.30),
-            "shooting__goals":                       ("Gol", 0.25),
-            "shooting__xgot":                        ("Şut Kalitesi", 0.20),
-            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.15),
-            "possession__aerials_won_pct":           ("Hava Topu %", 0.10),
+            "shooting__xg":                              ("Beklenen Gol",        0.28),
+            "shooting__goals":                           ("Gol",                 0.25),
+            "shooting__xgot":                            ("Şut Kalitesi",        0.20),
+            "possession__touches_in_opposition_box":     ("Rakip Ceza Dokunuş",  0.15),
+            "possession__aerials_won_pct":               ("Hava Topu %",         0.12),
         }
     },
 }
 
 FORMATION_ORDER = [
     "Kaleci",
-    "Sağ Bek","Sağ Stoper","Sol Stoper","Sol Bek",
-    "6 Numara","8 Numara",
-    "Sağ Açık","10 Numara","Sol Açık",
+    "Sağ Bek", "Sağ Stoper", "Sol Stoper", "Sol Bek",
+    "6 Numara", "8 Numara",
+    "Sağ Açık", "10 Numara", "Sol Açık",
     "Forvet"
 ]
+
+# ── EN İYİ OYUNCU SEÇİMİ ─────────────────────────────────────────────────────
+def get_best_player(pos_name, pos_config, weights_override, used_names):
+    candidates = [n for n in pos_config['candidates'] if n not in used_names]
+    if not candidates:
+        return None, []
+
+    metrics = {}
+    for col, (label, default_w) in pos_config['metrics'].items():
+        metrics[col] = (label, weights_override.get(col, default_w))
+
+    scores = []
+    for name in candidates:
+        row = df[df['name'] == name]
+        if row.empty:
+            continue
+        s = compute_composite_score(name, metrics)
+        r = row.iloc[0]
+        scores.append((name, s, r.get('team', ''), r.get('league', ''), r.get('position_primary', '')))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return (scores[0] if scores else None), scores
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 if 'weights' not in st.session_state:
@@ -442,109 +320,138 @@ st.markdown("""
     </div>
 </div>
 """, unsafe_allow_html=True)
-st.markdown("Her mevki için metriklerin ağırlığını ayarla — sistem tüm kombinasyonları değerlendirerek toplam skoru maksimize eden 11'i önerir.")
 
-# ── ÜST BÖLÜM: Ayarlar (sol) + Saha (sağ) ───────────────────────────────────
+st.markdown("""
+Oyuncu skorları **lig yüzdelik dilimlerine (percentile rank)** ve **son sezon form puanına** göre hesaplanır.
+Her mevki için metrik ağırlıklarını ayarlayabilirsin.
+""")
+
+# ── ANA LAYOUT ────────────────────────────────────────────────────────────────
 left_col, right_col = st.columns([1.1, 0.9], gap="large")
 
 with left_col:
     st.markdown('<div class="section-title">Mevki Ayarları</div>', unsafe_allow_html=True)
 
+    lineup = {}
+    used_names = set()
+    all_scores = {}
+
     for pos_name in FORMATION_ORDER:
         pos_config = POSITIONS[pos_name]
+
         with st.expander(f"**{pos_name}** — {pos_config['abbr']}", expanded=False):
             st.caption(f"Aday havuzu: {', '.join(pos_config['candidates'])}")
+
             weights_override = {}
             metrics_list = list(pos_config['metrics'].items())
             total_default = sum(w for _, (_, w) in metrics_list)
+
             for col, (label, default_w) in metrics_list:
                 pct = int(round((default_w / total_default) * 100))
-                new_val = st.slider(label, 0, 100, pct, 5, key=f"{pos_name}_{col}")
+                new_val = st.slider(
+                    label,
+                    min_value=0, max_value=100, value=pct, step=5,
+                    key=f"{pos_name}_{col}"
+                )
                 weights_override[col] = new_val / 100.0
-            if st.button(f"Bu mevki için uygula", key=f"calc_{pos_name}", type="primary"):
+
+            if st.button(f"Bu mevki için hesapla", key=f"calc_{pos_name}", type="primary"):
                 st.session_state.weights[pos_name] = weights_override
 
-# ── OPTİMİZASYON — tek seferde tüm 11 ───────────────────────────────────────
-lineup, all_scores = optimize_lineup(
-    POSITIONS,
-    FORMATION_ORDER,
-    st.session_state.weights,
-    df
-)
+        current_weights = st.session_state.weights.get(pos_name, {})
+        best, scores = get_best_player(pos_name, pos_config, current_weights, used_names)
+
+        if best:
+            lineup[pos_name] = best
+            used_names.add(best[0])
+            all_scores[pos_name] = scores
 
 with right_col:
-    st.markdown('<div class="section-title">Önerilen 11 — Formasyon</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Önerilen 11</div>', unsafe_allow_html=True)
 
     if lineup:
+        # ── SVG PITCH ─────────────────────────────────────────────────────────
         W, H = 400, 580
 
+        # Koordinatlar: X → saha sol=küçük, sağ=büyük
+        # Futbol konvansiyonu: Sağ Bek = sahada sağ = SVG'de büyük X
         formation_slots = {
             "Kaleci":     (200, 520),
-            "Sağ Bek":    (340, 400),
-            "Sağ Stoper": (250, 400),
+            "Sol Bek":    ( 60, 400),   # SVG solda = futbolda sol
             "Sol Stoper": (150, 400),
-            "Sol Bek":    ( 60, 400),
+            "Sağ Stoper": (250, 400),
+            "Sağ Bek":    (340, 400),   # SVG sağda = futbolda sağ
             "6 Numara":   (140, 290),
             "8 Numara":   (260, 290),
-            "Sağ Açık":   (340, 170),
+            "Sol Açık":   ( 60, 170),   # SVG solda = futbolda sol kanat
             "10 Numara":  (200, 170),
-            "Sol Açık":   ( 60, 170),
+            "Sağ Açık":   (340, 170),   # SVG sağda = futbolda sağ kanat
             "Forvet":     (200,  55),
         }
 
-        def player_card_svg(cx, cy, pos_abbr, player_name, score, is_best=True):
-            short_name = player_name.split()[-1] if player_name else "—"
-            score_txt  = str(score) if score else "—"
-            card_w, card_h = 76, 52
-            x0 = cx - card_w / 2
-            y0 = cy - card_h / 2
-            badge_color = "#e63946" if is_best else "#4a5568"
-            score_color = "#8bc34a" if is_best else "#9ca3af"
+        def player_card_svg(cx, cy, pos_abbr, player_name, score):
+            short = player_name.split()[-1] if player_name else "—"
+            score_txt = str(score) if score else "—"
+            cw, ch = 76, 52
+            x0 = cx - cw / 2
+            y0 = cy - ch / 2
             return f"""
-  <rect x="{x0:.1f}" y="{y0:.1f}" width="{card_w}" height="{card_h}"
-        rx="6" fill="rgba(8,13,26,0.82)" stroke="{badge_color}" stroke-width="1.4"/>
-  <rect x="{x0:.1f}" y="{y0:.1f}" width="{card_w}" height="14"
-        rx="6" fill="{badge_color}"/>
-  <rect x="{x0:.1f}" y="{y0+8:.1f}" width="{card_w}" height="6" fill="{badge_color}"/>
+  <rect x="{x0:.1f}" y="{y0:.1f}" width="{cw}" height="{ch}"
+        rx="6" fill="rgba(8,13,26,0.85)" stroke="#e63946" stroke-width="1.4"/>
+  <rect x="{x0:.1f}" y="{y0:.1f}" width="{cw}" height="14"
+        rx="6" fill="#e63946"/>
+  <rect x="{x0:.1f}" y="{y0+8:.1f}" width="{cw}" height="6" fill="#e63946"/>
   <text x="{cx:.1f}" y="{y0+10.5:.1f}" text-anchor="middle" dominant-baseline="middle"
         font-family="Barlow Condensed,sans-serif" font-size="8" font-weight="700"
         fill="#ffffff" letter-spacing="0.5">{pos_abbr}</text>
   <text x="{cx:.1f}" y="{y0+27:.1f}" text-anchor="middle" dominant-baseline="middle"
         font-family="Inter,sans-serif" font-size="9.5" font-weight="600"
-        fill="#ffffff">{short_name}</text>
+        fill="#ffffff">{short}</text>
   <text x="{cx:.1f}" y="{y0+42:.1f}" text-anchor="middle" dominant-baseline="middle"
         font-family="Barlow Condensed,sans-serif" font-size="11" font-weight="700"
-        fill="{score_color}">{score_txt}</text>"""
+        fill="#8bc34a">{score_txt}</text>"""
 
         pitch_lines = f"""
   <rect x="0" y="0" width="{W}" height="{H}" rx="10" fill="url(#grass)"/>
   <rect x="20" y="15" width="{W-40}" height="{H-30}" rx="4"
         fill="none" stroke="#2d6a2d" stroke-width="1.5"/>
-  <line x1="20" y1="{H//2}" x2="{W-20}" y2="{H//2}" stroke="#2d6a2d" stroke-width="1.2"/>
-  <circle cx="{W//2}" cy="{H//2}" r="38" fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
+  <line x1="20" y1="{H//2}" x2="{W-20}" y2="{H//2}"
+        stroke="#2d6a2d" stroke-width="1.2"/>
+  <circle cx="{W//2}" cy="{H//2}" r="38"
+          fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
   <circle cx="{W//2}" cy="{H//2}" r="2.5" fill="#2d6a2d"/>
-  <rect x="105" y="15" width="190" height="72" fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
-  <rect x="148" y="15" width="104" height="30" fill="none" stroke="#2d6a2d" stroke-width="1.0"/>
-  <rect x="105" y="{H-87}" width="190" height="72" fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
-  <rect x="148" y="{H-45}" width="104" height="30" fill="none" stroke="#2d6a2d" stroke-width="1.0"/>
+  <rect x="105" y="15" width="190" height="72"
+        fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
+  <rect x="148" y="15" width="104" height="30"
+        fill="none" stroke="#2d6a2d" stroke-width="1.0"/>
+  <rect x="105" y="{H-87}" width="190" height="72"
+        fill="none" stroke="#2d6a2d" stroke-width="1.2"/>
+  <rect x="148" y="{H-45}" width="104" height="30"
+        fill="none" stroke="#2d6a2d" stroke-width="1.0"/>
   <circle cx="{W//2}" cy="56" r="2" fill="#2d6a2d"/>
   <circle cx="{W//2}" cy="{H-56}" r="2" fill="#2d6a2d"/>"""
 
         cards_svg = ""
         for pos_name, (cx, cy) in formation_slots.items():
             player = lineup.get(pos_name)
-            abbr   = POSITIONS[pos_name]["abbr"]
+            abbr = POSITIONS[pos_name]["abbr"]
             if player:
-                cards_svg += player_card_svg(cx, cy, abbr, player['name'], player['score'], is_best=True)
+                cards_svg += player_card_svg(cx, cy, abbr, player[0], player[1])
             else:
-                cards_svg += player_card_svg(cx, cy, abbr, "—", None, is_best=False)
+                # Boş slot
+                cw, ch = 76, 52
+                x0 = cx - cw/2; y0 = cy - ch/2
+                cards_svg += f"""
+  <rect x="{x0:.1f}" y="{y0:.1f}" width="{cw}" height="{ch}"
+        rx="6" fill="rgba(8,13,26,0.4)" stroke="#2d6a2d" stroke-width="1" stroke-dasharray="4"/>
+  <text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="middle"
+        font-family="Barlow Condensed,sans-serif" font-size="9" fill="#4a7a4a">{abbr}</text>"""
 
-        svg_html = f"""<!DOCTYPE html>
+        svg_full = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<style>
-  body {{ margin:0; padding:0; background:transparent; }}
-  svg {{ width:100%; max-width:420px; display:block; margin:0 auto; border-radius:10px; }}
-</style></head><body>
+<style>body{{margin:0;padding:0;background:transparent;}}
+svg{{width:100%;max-width:420px;display:block;margin:0 auto;border-radius:10px;}}</style>
+</head><body>
 <svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="grass" x1="0" y1="0" x2="0" y2="1">
@@ -557,51 +464,58 @@ with right_col:
   {cards_svg}
 </svg></body></html>"""
 
-        components.html(svg_html, height=H + 20, scrolling=False)
+        components.html(svg_full, height=H + 20, scrolling=False)
 
-# ── ALT BÖLÜM: Kadro + Alternatifler ────────────────────────────────────────
-st.divider()
-
-if lineup:
-    detail_col, alt_col = st.columns([1, 1], gap="large")
-
-    with detail_col:
+        # ── KADRO LİSTESİ ─────────────────────────────────────────────────────
         st.markdown('<div class="section-title">Oyuncu Detayları</div>', unsafe_allow_html=True)
+
         for pos_name in FORMATION_ORDER:
             player = lineup.get(pos_name)
             if not player:
                 continue
+            name, score, team, league, primary_pos = player
+            form = get_form_score(df, name)
             st.markdown(f"""
-            <div class="pos-card" style="display:flex;justify-content:space-between;align-items:center;">
+            <div class="pos-card">
                 <div>
                     <div class="pos-card-title">{pos_name}</div>
-                    <div class="player-name">{player['name']}</div>
-                    <div class="player-meta">{player['team']} · {player['league']}</div>
+                    <div class="player-name">{name}</div>
+                    <div class="player-meta">{team} · {league} · Form: {form:.0f}/100</div>
                 </div>
-                <div class="score-badge">{player['score']}</div>
+                <div class="score-badge">{score}</div>
             </div>
             """, unsafe_allow_html=True)
 
-    with alt_col:
+        # ── ALTERNATİFLER ─────────────────────────────────────────────────────
         st.markdown('<div class="section-title">Alternatif Oyuncular</div>', unsafe_allow_html=True)
-        for pos_name in FORMATION_ORDER:
-            scores = all_scores.get(pos_name, [])
-            if len(scores) > 1:
-                selected_name = lineup.get(pos_name, {}).get('name', '')
+        for pos_name, scores in all_scores.items():
+            if scores and len(scores) > 1:
                 with st.expander(f"{pos_name} alternatifleri"):
-                    rows = []
-                    for d in scores[:5]:
-                        secili = "✓" if d['name'] == selected_name else ""
-                        rows.append({
-                            "": secili,
-                            "Oyuncu": d['name'],
-                            "Skor": d['score'],
-                            "Takım": d['team'],
-                            "Lig": d['league'],
-                        })
-                    alt_df = pd.DataFrame(rows)
+                    alt_df = pd.DataFrame(
+                        scores[:5],
+                        columns=["Oyuncu", "Skor", "Takım", "Lig", "Pozisyon"]
+                    )
                     st.dataframe(alt_df, use_container_width=True, hide_index=True)
+
+# ── METODOLOJİ NOTU ──────────────────────────────────────────────────────────
+with st.expander("📊 Metodoloji"):
+    st.markdown("""
+    **Skor Hesaplama Yöntemi**
+
+    Her oyuncu için kompozit skor iki bileşenden oluşur:
+
+    - **Metrik Skoru (%85):** Her metrik için ligteki yüzdelik dilim (percentile rank) kullanılır.
+      Yüzdelik dilim, oyuncunun o metrikte ligdeki oyuncuların kaçını geride bıraktığını gösterir.
+      Ağırlıklar literatür referanslıdır: *Apunts Journal of Physical Education (2024)* ve *Wyscout Index*.
+
+    - **Form Skoru (%15):** FotMob sezon rating'i (5.0–9.0 skalası) 0-100'e çevrilerek eklenir.
+
+    **Negatif Metrikler:** `goals_prevented` negatif olabileceğinden (kötü kaleci pozitif gol izni verir),
+    bu metrik için tüm kadroda min-max normalizasyon uygulanır.
+
+    **Pozisyon Koordinatları:** Sahada sağ = SVG'de büyük X değeri (standart futbol görünümü).
+    """)
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2024) · Geliştirici: M. Enes Şahin")
+st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2024) · Geliştirici: M. Enes Şahin · menessahin.github.io")
