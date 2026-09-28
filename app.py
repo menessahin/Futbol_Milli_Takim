@@ -135,7 +135,6 @@ h1, h2, h3 { font-family: 'Barlow Condensed', sans-serif; letter-spacing: 0.5px;
 @st.cache_data
 def load_data():
     df = pd.read_excel("milli_takim_stats_full.xlsx")
-    # Altay Bayındır'ın verileri eski sezona ait — sayısal kolonlar NaN yapıldı
     altay_idx = df[df['name'] == 'Altay Bayındır'].index
     if len(altay_idx) > 0:
         numeric_cols = df.select_dtypes(include='number').columns
@@ -152,7 +151,6 @@ def minmax_normalize(series):
     return (series - mn) / (mx - mn)
 
 def normalize_inverse(series):
-    """Yüksek = kötü metrikleri ters normalize et"""
     return 1 - minmax_normalize(series)
 
 @st.cache_data
@@ -164,7 +162,6 @@ def build_normalized(df):
     norm['league'] = df['league']
     norm['age'] = df['age']
 
-    # Pozitif metrikler (yüksek = iyi)
     pos_cols = [
         'goalkeeping__save_percentage', 'goalkeeping__goals_prevented',
         'goalkeeping__clean_sheets', 'goalkeeping__high_claims',
@@ -176,7 +173,6 @@ def build_normalized(df):
         'passing__pass_accuracy', 'passing__xa', 'passing__chances_created',
         'shooting__xg', 'shooting__goals', 'shooting__shots_on_target', 'shooting__xgot',
     ]
-    # Negatif metrikler (yüksek = kötü) → ters normalize
     neg_cols = [
         'defending__dribbled_past', 'defending__fouls_committed',
         'goalkeeping__error_led_to_goal',
@@ -358,8 +354,6 @@ def compute_score(player_row, metrics_weights):
     return round(score * 100, 1)
 
 def get_best_player(pos_name, pos_config, weights_override, used_names, norm_df):
-    # Aday havuzu artık geniş pozisyon kategorisine değil, elle atanmış oyuncu
-    # listesine (candidates) göre belirleniyor — bkz. proje notu.
     eligible = norm_df[norm_df['name'].isin(pos_config['candidates'])].copy()
     eligible = eligible[~eligible['name'].isin(used_names)]
     if eligible.empty:
@@ -369,7 +363,6 @@ def get_best_player(pos_name, pos_config, weights_override, used_names, norm_df)
     for col, (label, default_w) in pos_config['metrics'].items():
         metrics[col] = (label, weights_override.get(col, default_w))
 
-    # Ağırlıkları normalize et (toplamı 1'e tamamla)
     total_w = sum(w for _, w in metrics.values())
     if total_w > 0:
         metrics = {col: (lbl, w / total_w) for col, (lbl, w) in metrics.items()}
@@ -436,11 +429,9 @@ with left_col:
                 )
                 weights_override[col] = new_val / 100.0
 
-            # Hesapla butonu
             if st.button(f"Bu mevki için hesapla", key=f"calc_{pos_name}", type="primary"):
                 st.session_state.weights[pos_name] = weights_override
 
-        # Skoru hesapla (slider değişse bile)
         current_weights = st.session_state.weights.get(pos_name, {})
         best, scores = get_best_player(pos_name, pos_config, current_weights, used_names, norm_df)
 
@@ -455,27 +446,23 @@ with right_col:
     st.markdown('<div class="section-title">Önerilen 11</div>', unsafe_allow_html=True)
 
     if lineup:
-        # ── SVG PITCH ─────────────────────────────────────────────────────────
-        # Koordinat sistemi: viewBox 0 0 400 580 (dikey saha, kale aşağıda)
-        # Satırlar (y merkez): GK=520, DEF=400, MID=290, ATT=170, FW=55
         W, H = 400, 580
 
         formation_slots = {
-            "Kaleci":    (200, 520),
-            "Sağ Bek":   ( 60, 400),
-            "Sağ Stoper":(150, 400),
-            "Sol Stoper":(250, 400),
-            "Sol Bek":   (340, 400),
-            "6 Numara":  (140, 290),
-            "8 Numara":  (260, 290),
-            "Sağ Açık":  ( 60, 170),
-            "10 Numara": (200, 170),
-            "Sol Açık":  (340, 170),
-            "Forvet":    (200,  55),
+            "Kaleci":     (200, 520),
+            "Sağ Bek":    (340, 400),
+            "Sağ Stoper": (250, 400),
+            "Sol Stoper": (150, 400),
+            "Sol Bek":    ( 60, 400),
+            "6 Numara":   (140, 290),
+            "8 Numara":   (260, 290),
+            "Sağ Açık":   (340, 170),
+            "10 Numara":  (200, 170),
+            "Sol Açık":   ( 60, 170),
+            "Forvet":     (200,  55),
         }
 
         def player_card_svg(cx, cy, pos_abbr, player_name, score, is_best=True):
-            """Oyuncu kartı: üstte mevki rozeti, ortada isim, altta skor."""
             short_name = player_name.split()[-1] if player_name else "—"
             score_txt  = str(score) if score else "—"
             card_w, card_h = 76, 52
@@ -503,7 +490,6 @@ with right_col:
         font-family="Barlow Condensed,sans-serif" font-size="11" font-weight="700"
         fill="{score_color}">{score_txt}</text>"""
 
-        # Saha çizgileri SVG'si
         pitch_lines = f"""
   <!-- Zemin -->
   <rect x="0" y="0" width="{W}" height="{H}" rx="10" fill="url(#grass)"/>
@@ -541,7 +527,6 @@ with right_col:
   <circle cx="{W//2}" cy="{H-56}" r="2" fill="#2d6a2d"/>
 """
 
-        # Oyuncu kartlarını oluştur
         cards_svg = ""
         for pos_name, (cx, cy) in formation_slots.items():
             player = lineup.get(pos_name)
