@@ -375,7 +375,7 @@ POSITIONS = {
     "Sol Açık": {
         "abbr": "LW", "formation_slot": "lw",
         "eligible": ["Left Winger","Attacking Midfielder","Left Back"],
-        "candidates": ["Aral Şimşir","İlhan Fakılı","Barış Alper Yılmaz"],
+        "candidates": ["Aral Şimşir","İlhan Fakılı","Barış Alper Yılmaz","Kerem Aktürkoglu","Can Uzun","Yunus Akgün"],
         "metrics": {
             "shooting__xg":                          ("Beklenen Gol", 0.25),
             "passing__xa":                           ("Beklenen Asist", 0.25),
@@ -387,7 +387,7 @@ POSITIONS = {
     "10 Numara": {
         "abbr": "10", "formation_slot": "am",
         "eligible": ["Attacking Midfielder","Defensive Midfielder"],
-        "candidates": ["Arda Güler","Can Uzun"],
+        "candidates": ["Arda Güler","Can Uzun","İrfan Kahveci","Yunus Akgün"],
         "metrics": {
             "passing__xa":                           ("Beklenen Asist", 0.30),
             "passing__chances_created":              ("Fırsat Yaratma", 0.30),
@@ -604,4 +604,4 @@ if lineup:
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2026) · Geliştirici: M. Enes Şahin")
+st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2024) · Geliştirici: M. Enes Şahin")
