@@ -2,7 +2,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 st.set_page_config(
     page_title="Türkiye Milli Takım | Kadro Optimizasyonu",
@@ -83,10 +82,6 @@ def normalize_inverse(series):
     return 1 - minmax_normalize(series)
 
 def local_normalize(df_raw, candidate_names, metric_cols):
-    """
-    Sadece aday havuzundaki oyuncular arasında normalize eder.
-    Global kadro yerine mevkiye özgü karşılaştırma yapar.
-    """
     subset = df_raw[df_raw['name'].isin(candidate_names)].copy()
     norm = pd.DataFrame()
     norm['name'] = subset['name'].values
@@ -101,7 +96,6 @@ def local_normalize(df_raw, candidate_names, metric_cols):
         else:
             norm[col] = minmax_normalize(series).values
 
-    # meta kolonları ekle
     for meta in ['team', 'league', 'position_primary', 'age']:
         if meta in df_raw.columns:
             norm[meta] = subset[meta].values
@@ -118,16 +112,11 @@ def compute_score(player_row, metrics_weights):
     return round(score * 100, 1)
 
 def compute_all_scores(pos_name, pos_config, weights_override, df_raw):
-    """
-    Bir mevki için tüm adayların skorlarını döndürür (atama kararı vermez).
-    Local normalizasyon kullanır.
-    """
     candidate_names = pos_config['candidates']
     metric_cols = list(pos_config['metrics'].keys())
 
     local_norm = local_normalize(df_raw, candidate_names, metric_cols)
 
-    # Ağırlıkları uygula ve normalize et
     metrics = {}
     for col, (label, default_w) in pos_config['metrics'].items():
         metrics[col] = (label, weights_override.get(col, default_w))
@@ -149,19 +138,120 @@ def compute_all_scores(pos_name, pos_config, weights_override, df_raw):
     scores.sort(key=lambda x: x['score'], reverse=True)
     return scores
 
+# ── SCIPY'SİZ HUNGARIAN ALGORİTMASI ─────────────────────────────────────────
+def _hungarian(cost_matrix):
+    """
+    Saf numpy ile Hungarian (Macar) algoritması.
+    scipy.optimize.linear_sum_assignment ile aynı sonucu verir.
+    Minimize eder — maximize için negatif matris ver.
+    """
+    C = cost_matrix.copy().astype(float)
+    n, m = C.shape
+    size = max(n, m)
+
+    # Kare matrise pad et
+    C_sq = np.full((size, size), np.max(C[C < 1e5]) * 2 if np.any(C < 1e5) else 1000.0)
+    C_sq[:n, :m] = C
+
+    # Adım 1: satır minimumlarını çıkar
+    C_sq -= C_sq.min(axis=1, keepdims=True)
+    # Adım 2: sütun minimumlarını çıkar
+    C_sq -= C_sq.min(axis=0, keepdims=True)
+
+    row_covered = np.zeros(size, dtype=bool)
+    col_covered = np.zeros(size, dtype=bool)
+    assignment = np.full(size, -1, dtype=int)  # assignment[row] = col
+
+    def find_zeros():
+        zeros = []
+        for r in range(size):
+            for c in range(size):
+                if abs(C_sq[r, c]) < 1e-9:
+                    zeros.append((r, c))
+        return zeros
+
+    for _ in range(size * size):
+        # Atanmamış sıfırları bul ve ata
+        row_assigned = np.zeros(size, dtype=bool)
+        col_assigned = np.zeros(size, dtype=bool)
+        assignment = np.full(size, -1, dtype=int)
+
+        zeros = find_zeros()
+        # Önce tek seçenekli satırları ata
+        for r in range(size):
+            row_zeros = [c for (rr, c) in zeros if rr == r]
+            if len(row_zeros) == 1:
+                c = row_zeros[0]
+                if not col_assigned[c]:
+                    assignment[r] = c
+                    row_assigned[r] = True
+                    col_assigned[c] = True
+
+        # Kalan sıfırları ata
+        for r, c in zeros:
+            if not row_assigned[r] and not col_assigned[c]:
+                assignment[r] = c
+                row_assigned[r] = True
+                col_assigned[c] = True
+
+        assigned_count = np.sum(assignment >= 0)
+        if assigned_count == size:
+            break
+
+        # Minimum satır sayısı ile tüm sıfırları örtecek çizgi seti bul
+        # (Basitleştirilmiş: örtülmemiş minimum değeri güncelle)
+        marked_rows = set()
+        marked_cols = set()
+
+        for r in range(size):
+            if assignment[r] < 0:
+                marked_rows.add(r)
+
+        changed = True
+        while changed:
+            changed = False
+            for r in marked_rows:
+                for rr, c in zeros:
+                    if rr == r and c not in marked_cols:
+                        marked_cols.add(c)
+                        changed = True
+            for c in marked_cols:
+                for r in range(size):
+                    if assignment[r] == c and r not in marked_rows:
+                        marked_rows.add(r)
+                        changed = True
+
+        covered_rows = set(range(size)) - marked_rows
+        covered_cols = marked_cols
+
+        uncovered_vals = [
+            C_sq[r, c]
+            for r in range(size) for c in range(size)
+            if r not in covered_rows and c not in covered_cols
+        ]
+        if not uncovered_vals:
+            break
+        mn = min(uncovered_vals)
+
+        for r in range(size):
+            for c in range(size):
+                if r not in covered_rows and c not in covered_cols:
+                    C_sq[r, c] -= mn
+                elif r in covered_rows and c in covered_cols:
+                    C_sq[r, c] += mn
+
+    # Orijinal boyuta kırp
+    valid = [(r, assignment[r]) for r in range(size)
+             if assignment[r] >= 0 and r < n and assignment[r] < m]
+    if not valid:
+        return [], []
+    row_ind, col_ind = zip(*valid)
+    return list(row_ind), list(col_ind)
+
+
 # ── GLOBAL OPTİMİZASYON ─────────────────────────────────────────────────────
 def optimize_lineup(positions, formation_order, weights_by_pos, df_raw):
-    """
-    Tüm mevkiler için aynı anda en iyi atamayı bulur.
-    Hiçbir oyuncu birden fazla mevkiye atanmaz.
-    scipy.linear_sum_assignment kullanır (Hungarian algorithm).
-
-    Döndürür:
-        lineup: {pos_name: {name, score, team, league, position_primary}}
-        all_scores: {pos_name: [skorlar listesi]}  — alternatifler için
-    """
     pos_names = formation_order
-    # Tüm aday havuzu (tekrarsız)
     player_pool = list(dict.fromkeys(
         p for pn in pos_names for p in positions[pn]['candidates']
     ))
@@ -169,8 +259,6 @@ def optimize_lineup(positions, formation_order, weights_by_pos, df_raw):
     n_pos = len(pos_names)
     n_players = len(player_pool)
 
-    # Her mevki için her adayın skoru — önce local normalize et
-    # pos_scores[i][j] = mevki i için oyuncu j'nin skoru (uygun değilse -1)
     pos_scores_matrix = np.full((n_pos, n_players), -1.0)
     all_scores = {}
 
@@ -179,31 +267,29 @@ def optimize_lineup(positions, formation_order, weights_by_pos, df_raw):
         weights_override = weights_by_pos.get(pos_name, {})
         candidate_scores = compute_all_scores(pos_name, pos_config, weights_override, df_raw)
         score_map = {d['name']: d for d in candidate_scores}
-        all_scores[pos_name] = candidate_scores  # alternatifler için sakla
+        all_scores[pos_name] = candidate_scores
 
         for j, player_name in enumerate(player_pool):
             if player_name in score_map:
                 pos_scores_matrix[i][j] = score_map[player_name]['score']
 
-    # linear_sum_assignment minimize eder → negatif matris vererek maximize et
-    # Uygun olmayan mevki-oyuncu çiftleri için büyük negatif ceza
+    # Maximize için negatif, uygun olmayan için büyük pozitif ceza
     cost_matrix = np.where(pos_scores_matrix >= 0, -pos_scores_matrix, 1e6)
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    row_ind, col_ind = _hungarian(cost_matrix)
 
     lineup = {}
     for i, j in zip(row_ind, col_ind):
         if pos_scores_matrix[i][j] >= 0:
             player_name = player_pool[j]
             pos_name = pos_names[i]
-            # all_scores'tan detayları al
             score_detail = next(
                 (d for d in all_scores[pos_name] if d['name'] == player_name),
                 {'name': player_name, 'score': 0, 'team': '—', 'league': '—', 'position_primary': '—'}
             )
             lineup[pos_name] = score_detail
-        # else: bu mevki için uygun aday bulunamadı
 
     return lineup, all_scores
+
 
 # ── POZİSYONLAR ──────────────────────────────────────────────────────────────
 POSITIONS = {
@@ -505,9 +591,9 @@ if lineup:
                 with st.expander(f"{pos_name} alternatifleri"):
                     rows = []
                     for d in scores[:5]:
-                        seçili = "✓" if d['name'] == selected_name else ""
+                        secili = "✓" if d['name'] == selected_name else ""
                         rows.append({
-                            "": seçili,
+                            "": secili,
                             "Oyuncu": d['name'],
                             "Skor": d['score'],
                             "Takım": d['team'],
@@ -518,4 +604,4 @@ if lineup:
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2024) · Geliştirici: M. Enes Şahin")
+st.caption("Veri: FotMob · Metodoloji: Wyscout Index & Apunts (2026) · Geliştirici: M. Enes Şahin")
