@@ -391,8 +391,7 @@ with right_col:
 
         def player_card_svg(cx, cy, pos_abbr, player_name, score):
             short = player_name.split()[-1] if player_name else "—"
-            score_txt = str(score) if score else "—"
-            cw, ch = 76, 52
+            cw, ch = 76, 40
             x0 = cx - cw / 2
             y0 = cy - ch / 2
             return f"""
@@ -406,10 +405,7 @@ with right_col:
         fill="#ffffff" letter-spacing="0.5">{pos_abbr}</text>
   <text x="{cx:.1f}" y="{y0+27:.1f}" text-anchor="middle" dominant-baseline="middle"
         font-family="Inter,sans-serif" font-size="9.5" font-weight="600"
-        fill="#ffffff">{short}</text>
-  <text x="{cx:.1f}" y="{y0+42:.1f}" text-anchor="middle" dominant-baseline="middle"
-        font-family="Barlow Condensed,sans-serif" font-size="11" font-weight="700"
-        fill="#8bc34a">{score_txt}</text>"""
+        fill="#ffffff">{short}</text>"""
 
         pitch_lines = f"""
   <rect x="0" y="0" width="{W}" height="{H}" rx="10" fill="url(#grass)"/>
@@ -429,7 +425,14 @@ with right_col:
   <rect x="148" y="{H-45}" width="104" height="30"
         fill="none" stroke="#2d6a2d" stroke-width="1.0"/>
   <circle cx="{W//2}" cy="56" r="2" fill="#2d6a2d"/>
-  <circle cx="{W//2}" cy="{H-56}" r="2" fill="#2d6a2d"/>"""
+  <circle cx="{W//2}" cy="{H-56}" r="2" fill="#2d6a2d"/>
+  <!-- Filigran -->
+  <text x="{W-14}" y="22" text-anchor="end" dominant-baseline="middle"
+        font-family="Barlow Condensed,sans-serif" font-size="11" font-weight="700"
+        fill="rgba(255,255,255,0.45)" letter-spacing="0.8">M.Enes SAHIN</text>
+  <text x="{W-14}" y="35" text-anchor="end" dominant-baseline="middle"
+        font-family="Inter,sans-serif" font-size="8" font-weight="400"
+        fill="rgba(255,255,255,0.30)" letter-spacing="0.5">Data Scientist</text>"""
 
         cards_svg = ""
         for pos_name, (cx, cy) in formation_slots.items():
