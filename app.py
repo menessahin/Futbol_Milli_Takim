@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 
@@ -551,8 +552,17 @@ with right_col:
                 cards_svg += player_card_svg(cx, cy, abbr, "—", None, is_best=False)
 
         svg_html = f"""
-<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"
-     style="width:100%;max-width:420px;display:block;margin:0 auto;border-radius:10px;">
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ margin: 0; padding: 0; background: transparent; }}
+  svg {{ width: 100%; max-width: 420px; display: block; margin: 0 auto; border-radius: 10px; }}
+</style>
+</head>
+<body>
+<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="grass" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%"   stop-color="#1a3d1a"/>
@@ -562,9 +572,11 @@ with right_col:
   </defs>
   {pitch_lines}
   {cards_svg}
-</svg>"""
+</svg>
+</body>
+</html>"""
 
-        st.markdown(svg_html, unsafe_allow_html=True)
+        components.html(svg_html, height=H + 20, scrolling=False)
 
         # ── KADRO LİSTESİ ─────────────────────────────────────────────────────
         st.markdown('<div class="section-title">Oyuncu Detayları</div>', unsafe_allow_html=True)
