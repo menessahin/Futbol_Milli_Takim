@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 st.set_page_config(
     page_title="Türkiye Milli Takım | Kadro Optimizasyonu",
@@ -70,6 +71,8 @@ def load_data():
 
 df = load_data()
 
+NEG_COLS = {'defending__dribbled_past', 'defending__fouls_committed', 'goalkeeping__error_led_to_goal'}
+
 def minmax_normalize(series):
     mn, mx = series.min(), series.max()
     if mx == mn:
@@ -79,39 +82,128 @@ def minmax_normalize(series):
 def normalize_inverse(series):
     return 1 - minmax_normalize(series)
 
-@st.cache_data
-def build_normalized(df):
+def local_normalize(df_raw, candidate_names, metric_cols):
+    """
+    Sadece aday havuzundaki oyuncular arasında normalize eder.
+    Global kadro yerine mevkiye özgü karşılaştırma yapar.
+    """
+    subset = df_raw[df_raw['name'].isin(candidate_names)].copy()
     norm = pd.DataFrame()
-    norm['name'] = df['name']
-    norm['position_primary'] = df['position_primary']
-    norm['team'] = df['team']
-    norm['league'] = df['league']
-    norm['age'] = df['age']
+    norm['name'] = subset['name'].values
 
-    pos_cols = [
-        'goalkeeping__save_percentage','goalkeeping__goals_prevented',
-        'goalkeeping__clean_sheets','goalkeeping__high_claims',
-        'distribution__pass_accuracy',
-        'defending__interceptions','defending__tackles','defending__clearances',
-        'defending__recoveries','defending__possession_won_final_3rd',
-        'possession__aerials_won_pct','possession__duels_won_pct',
-        'possession__touches_in_opposition_box','possession__dribbles_success_rate',
-        'passing__pass_accuracy','passing__xa','passing__chances_created',
-        'shooting__xg','shooting__goals','shooting__shots_on_target','shooting__xgot',
-    ]
-    neg_cols = [
-        'defending__dribbled_past','defending__fouls_committed',
-        'goalkeeping__error_led_to_goal',
-    ]
-    for col in pos_cols:
-        if col in df.columns:
-            norm[col] = minmax_normalize(df[col].fillna(df[col].median()))
-    for col in neg_cols:
-        if col in df.columns:
-            norm[col] = normalize_inverse(df[col].fillna(df[col].median()))
-    return norm
+    for col in metric_cols:
+        if col not in df_raw.columns:
+            norm[col] = 0.5
+            continue
+        series = subset[col].fillna(subset[col].median() if subset[col].notna().any() else 0.5)
+        if col in NEG_COLS:
+            norm[col] = normalize_inverse(series).values
+        else:
+            norm[col] = minmax_normalize(series).values
 
-norm_df = build_normalized(df)
+    # meta kolonları ekle
+    for meta in ['team', 'league', 'position_primary', 'age']:
+        if meta in df_raw.columns:
+            norm[meta] = subset[meta].values
+
+    return norm.reset_index(drop=True)
+
+def compute_score(player_row, metrics_weights):
+    score = 0.0
+    for col, (label, w) in metrics_weights.items():
+        val = player_row.get(col, 0.5)
+        if pd.isna(val):
+            val = 0.5
+        score += val * w
+    return round(score * 100, 1)
+
+def compute_all_scores(pos_name, pos_config, weights_override, df_raw):
+    """
+    Bir mevki için tüm adayların skorlarını döndürür (atama kararı vermez).
+    Local normalizasyon kullanır.
+    """
+    candidate_names = pos_config['candidates']
+    metric_cols = list(pos_config['metrics'].keys())
+
+    local_norm = local_normalize(df_raw, candidate_names, metric_cols)
+
+    # Ağırlıkları uygula ve normalize et
+    metrics = {}
+    for col, (label, default_w) in pos_config['metrics'].items():
+        metrics[col] = (label, weights_override.get(col, default_w))
+    total_w = sum(w for _, w in metrics.values())
+    if total_w > 0:
+        metrics = {col: (lbl, w / total_w) for col, (lbl, w) in metrics.items()}
+
+    scores = []
+    for _, row in local_norm.iterrows():
+        s = compute_score(row, metrics)
+        scores.append({
+            'name': row['name'],
+            'score': s,
+            'team': row.get('team', '—'),
+            'league': row.get('league', '—'),
+            'position_primary': row.get('position_primary', '—'),
+        })
+
+    scores.sort(key=lambda x: x['score'], reverse=True)
+    return scores
+
+# ── GLOBAL OPTİMİZASYON ─────────────────────────────────────────────────────
+def optimize_lineup(positions, formation_order, weights_by_pos, df_raw):
+    """
+    Tüm mevkiler için aynı anda en iyi atamayı bulur.
+    Hiçbir oyuncu birden fazla mevkiye atanmaz.
+    scipy.linear_sum_assignment kullanır (Hungarian algorithm).
+
+    Döndürür:
+        lineup: {pos_name: {name, score, team, league, position_primary}}
+        all_scores: {pos_name: [skorlar listesi]}  — alternatifler için
+    """
+    pos_names = formation_order
+    # Tüm aday havuzu (tekrarsız)
+    player_pool = list(dict.fromkeys(
+        p for pn in pos_names for p in positions[pn]['candidates']
+    ))
+
+    n_pos = len(pos_names)
+    n_players = len(player_pool)
+
+    # Her mevki için her adayın skoru — önce local normalize et
+    # pos_scores[i][j] = mevki i için oyuncu j'nin skoru (uygun değilse -1)
+    pos_scores_matrix = np.full((n_pos, n_players), -1.0)
+    all_scores = {}
+
+    for i, pos_name in enumerate(pos_names):
+        pos_config = positions[pos_name]
+        weights_override = weights_by_pos.get(pos_name, {})
+        candidate_scores = compute_all_scores(pos_name, pos_config, weights_override, df_raw)
+        score_map = {d['name']: d for d in candidate_scores}
+        all_scores[pos_name] = candidate_scores  # alternatifler için sakla
+
+        for j, player_name in enumerate(player_pool):
+            if player_name in score_map:
+                pos_scores_matrix[i][j] = score_map[player_name]['score']
+
+    # linear_sum_assignment minimize eder → negatif matris vererek maximize et
+    # Uygun olmayan mevki-oyuncu çiftleri için büyük negatif ceza
+    cost_matrix = np.where(pos_scores_matrix >= 0, -pos_scores_matrix, 1e6)
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    lineup = {}
+    for i, j in zip(row_ind, col_ind):
+        if pos_scores_matrix[i][j] >= 0:
+            player_name = player_pool[j]
+            pos_name = pos_names[i]
+            # all_scores'tan detayları al
+            score_detail = next(
+                (d for d in all_scores[pos_name] if d['name'] == player_name),
+                {'name': player_name, 'score': 0, 'team': '—', 'league': '—', 'position_primary': '—'}
+            )
+            lineup[pos_name] = score_detail
+        # else: bu mevki için uygun aday bulunamadı
+
+    return lineup, all_scores
 
 # ── POZİSYONLAR ──────────────────────────────────────────────────────────────
 POSITIONS = {
@@ -130,24 +222,24 @@ POSITIONS = {
         "abbr": "RST", "formation_slot": "rcb", "eligible": ["Center Back"],
         "candidates": ["Merih Demiral","Ozan Kabak","Samet Akaydin"],
         "metrics": {
-            "defending__interceptions":  ("Top Kapma", 0.23),
-            "defending__tackles":        ("Müdahale", 0.19),
+            "defending__interceptions":   ("Top Kapma", 0.23),
+            "defending__tackles":         ("Müdahale", 0.19),
             "possession__aerials_won_pct":("Hava Topu %", 0.19),
-            "defending__clearances":     ("Uzaklaştırma", 0.16),
-            "defending__recoveries":     ("Top Kazanma", 0.13),
-            "passing__pass_accuracy":    ("Pas İsabeti", 0.10),
+            "defending__clearances":      ("Uzaklaştırma", 0.16),
+            "defending__recoveries":      ("Top Kazanma", 0.13),
+            "passing__pass_accuracy":     ("Pas İsabeti", 0.10),
         }
     },
     "Sol Stoper": {
         "abbr": "LST", "formation_slot": "lcb", "eligible": ["Center Back"],
         "candidates": ["Emirhan Topçu","Abdülkerim Bardakci","Adil Demirbağ"],
         "metrics": {
-            "defending__interceptions":  ("Top Kapma", 0.23),
-            "defending__tackles":        ("Müdahale", 0.19),
+            "defending__interceptions":   ("Top Kapma", 0.23),
+            "defending__tackles":         ("Müdahale", 0.19),
             "possession__aerials_won_pct":("Hava Topu %", 0.19),
-            "defending__clearances":     ("Uzaklaştırma", 0.16),
-            "defending__recoveries":     ("Top Kazanma", 0.13),
-            "passing__pass_accuracy":    ("Pas İsabeti", 0.10),
+            "defending__clearances":      ("Uzaklaştırma", 0.16),
+            "defending__recoveries":      ("Top Kazanma", 0.13),
+            "passing__pass_accuracy":     ("Pas İsabeti", 0.10),
         }
     },
     "Sağ Bek": {
@@ -187,23 +279,23 @@ POSITIONS = {
         "eligible": ["Defensive Midfielder","Attacking Midfielder"],
         "candidates": ["Orkun Kökcü","Demir Tıknaz","Bartuğ Elmaz"],
         "metrics": {
-            "passing__xa":                            ("Beklenen Asist", 0.25),
-            "passing__chances_created":               ("Fırsat Yaratma", 0.20),
-            "shooting__xg":                           ("Beklenen Gol", 0.20),
-            "possession__touches_in_opposition_box":  ("Rakip Ceza Dokunuş", 0.20),
-            "defending__tackles":                     ("Müdahale", 0.15),
+            "passing__xa":                           ("Beklenen Asist", 0.25),
+            "passing__chances_created":              ("Fırsat Yaratma", 0.20),
+            "shooting__xg":                          ("Beklenen Gol", 0.20),
+            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
+            "defending__tackles":                    ("Müdahale", 0.15),
         }
     },
     "Sol Açık": {
         "abbr": "LW", "formation_slot": "lw",
         "eligible": ["Left Winger","Attacking Midfielder","Left Back"],
-        "candidates": ["Aral Şimşir","İlhan Fakılı"],
+        "candidates": ["Aral Şimşir","İlhan Fakılı","Barış Alper Yılmaz"],
         "metrics": {
-            "shooting__xg":                           ("Beklenen Gol", 0.25),
-            "passing__xa":                            ("Beklenen Asist", 0.25),
-            "possession__dribbles_success_rate":      ("Dribling %", 0.20),
-            "possession__touches_in_opposition_box":  ("Rakip Ceza Dokunuş", 0.20),
-            "shooting__shots_on_target":              ("İsabetli Şut", 0.10),
+            "shooting__xg":                          ("Beklenen Gol", 0.25),
+            "passing__xa":                           ("Beklenen Asist", 0.25),
+            "possession__dribbles_success_rate":     ("Dribling %", 0.20),
+            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
+            "shooting__shots_on_target":             ("İsabetli Şut", 0.10),
         }
     },
     "10 Numara": {
@@ -211,22 +303,22 @@ POSITIONS = {
         "eligible": ["Attacking Midfielder","Defensive Midfielder"],
         "candidates": ["Arda Güler","Can Uzun"],
         "metrics": {
-            "passing__xa":                            ("Beklenen Asist", 0.30),
-            "passing__chances_created":               ("Fırsat Yaratma", 0.30),
-            "shooting__xg":                           ("Beklenen Gol", 0.20),
-            "possession__touches_in_opposition_box":  ("Rakip Ceza Dokunuş", 0.20),
+            "passing__xa":                           ("Beklenen Asist", 0.30),
+            "passing__chances_created":              ("Fırsat Yaratma", 0.30),
+            "shooting__xg":                          ("Beklenen Gol", 0.20),
+            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
         }
     },
     "Sağ Açık": {
         "abbr": "RW", "formation_slot": "rw",
         "eligible": ["Right Winger","Attacking Midfielder","Right Wing-Back"],
-        "candidates": ["Yunus Akgün","Oğuz Aydın","İrfan Kahveci"],
+        "candidates": ["Yunus Akgün","Oğuz Aydın","İrfan Kahveci","Barış Alper Yılmaz"],
         "metrics": {
-            "shooting__xg":                           ("Beklenen Gol", 0.25),
-            "passing__xa":                            ("Beklenen Asist", 0.20),
-            "possession__dribbles_success_rate":      ("Dribling %", 0.20),
-            "possession__touches_in_opposition_box":  ("Rakip Ceza Dokunuş", 0.20),
-            "shooting__shots_on_target":              ("İsabetli Şut", 0.15),
+            "shooting__xg":                          ("Beklenen Gol", 0.25),
+            "passing__xa":                           ("Beklenen Asist", 0.20),
+            "possession__dribbles_success_rate":     ("Dribling %", 0.20),
+            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.20),
+            "shooting__shots_on_target":             ("İsabetli Şut", 0.15),
         }
     },
     "Forvet": {
@@ -234,11 +326,11 @@ POSITIONS = {
         "eligible": ["Striker","Attacking Midfielder","Left Winger","Right Winger"],
         "candidates": ["Kerem Aktürkoglu","Barış Alper Yılmaz","Deniz Gül"],
         "metrics": {
-            "shooting__xg":                           ("Beklenen Gol", 0.30),
-            "shooting__goals":                        ("Gol", 0.25),
-            "shooting__xgot":                         ("Şut Kalitesi", 0.20),
-            "possession__touches_in_opposition_box":  ("Rakip Ceza Dokunuş", 0.15),
-            "possession__aerials_won_pct":            ("Hava Topu %", 0.10),
+            "shooting__xg":                          ("Beklenen Gol", 0.30),
+            "shooting__goals":                       ("Gol", 0.25),
+            "shooting__xgot":                        ("Şut Kalitesi", 0.20),
+            "possession__touches_in_opposition_box": ("Rakip Ceza Dokunuş", 0.15),
+            "possession__aerials_won_pct":           ("Hava Topu %", 0.10),
         }
     },
 }
@@ -250,33 +342,6 @@ FORMATION_ORDER = [
     "Sağ Açık","10 Numara","Sol Açık",
     "Forvet"
 ]
-
-# ── SKOR ─────────────────────────────────────────────────────────────────────
-def compute_score(player_row, metrics_weights):
-    score = 0.0
-    for col, (label, w) in metrics_weights.items():
-        val = player_row.get(col, 0.5)
-        if pd.isna(val): val = 0.5
-        score += val * w
-    return round(score * 100, 1)
-
-def get_best_player(pos_name, pos_config, weights_override, used_names, norm_df):
-    eligible = norm_df[norm_df['name'].isin(pos_config['candidates'])].copy()
-    eligible = eligible[~eligible['name'].isin(used_names)]
-    if eligible.empty:
-        return None, 0
-    metrics = {}
-    for col, (label, default_w) in pos_config['metrics'].items():
-        metrics[col] = (label, weights_override.get(col, default_w))
-    total_w = sum(w for _, w in metrics.values())
-    if total_w > 0:
-        metrics = {col: (lbl, w/total_w) for col,(lbl,w) in metrics.items()}
-    scores = []
-    for _, row in eligible.iterrows():
-        s = compute_score(row, metrics)
-        scores.append((row['name'], s, row['team'], row['league'], row['position_primary']))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    return scores[0], scores
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 if 'weights' not in st.session_state:
@@ -291,14 +356,10 @@ st.markdown("""
     </div>
 </div>
 """, unsafe_allow_html=True)
-st.markdown("Her mevki için metriklerin ağırlığını ayarla — sistem en yüksek skoru alan oyuncuyu otomatik olarak önerir.")
+st.markdown("Her mevki için metriklerin ağırlığını ayarla — sistem tüm kombinasyonları değerlendirerek toplam skoru maksimize eden 11'i önerir.")
 
 # ── ÜST BÖLÜM: Ayarlar (sol) + Saha (sağ) ───────────────────────────────────
 left_col, right_col = st.columns([1.1, 0.9], gap="large")
-
-lineup = {}
-used_names = set()
-all_scores = {}
 
 with left_col:
     st.markdown('<div class="section-title">Mevki Ayarları</div>', unsafe_allow_html=True)
@@ -309,20 +370,21 @@ with left_col:
             st.caption(f"Aday havuzu: {', '.join(pos_config['candidates'])}")
             weights_override = {}
             metrics_list = list(pos_config['metrics'].items())
-            total_default = sum(w for _,(_, w) in metrics_list)
+            total_default = sum(w for _, (_, w) in metrics_list)
             for col, (label, default_w) in metrics_list:
                 pct = int(round((default_w / total_default) * 100))
                 new_val = st.slider(label, 0, 100, pct, 5, key=f"{pos_name}_{col}")
                 weights_override[col] = new_val / 100.0
-            if st.button(f"Bu mevki için hesapla", key=f"calc_{pos_name}", type="primary"):
+            if st.button(f"Bu mevki için uygula", key=f"calc_{pos_name}", type="primary"):
                 st.session_state.weights[pos_name] = weights_override
 
-        current_weights = st.session_state.weights.get(pos_name, {})
-        best, scores = get_best_player(pos_name, pos_config, current_weights, used_names, norm_df)
-        if best:
-            lineup[pos_name] = best
-            used_names.add(best[0])
-            all_scores[pos_name] = scores
+# ── OPTİMİZASYON — tek seferde tüm 11 ───────────────────────────────────────
+lineup, all_scores = optimize_lineup(
+    POSITIONS,
+    FORMATION_ORDER,
+    st.session_state.weights,
+    df
+)
 
 with right_col:
     st.markdown('<div class="section-title">Önerilen 11 — Formasyon</div>', unsafe_allow_html=True)
@@ -387,7 +449,7 @@ with right_col:
             player = lineup.get(pos_name)
             abbr   = POSITIONS[pos_name]["abbr"]
             if player:
-                cards_svg += player_card_svg(cx, cy, abbr, player[0], player[1], is_best=True)
+                cards_svg += player_card_svg(cx, cy, abbr, player['name'], player['score'], is_best=True)
             else:
                 cards_svg += player_card_svg(cx, cy, abbr, "—", None, is_best=False)
 
@@ -411,7 +473,7 @@ with right_col:
 
         components.html(svg_html, height=H + 20, scrolling=False)
 
-# ── ALT BÖLÜM: Tam genişlik — Kadro + Alternatifler ─────────────────────────
+# ── ALT BÖLÜM: Kadro + Alternatifler ────────────────────────────────────────
 st.divider()
 
 if lineup:
@@ -423,24 +485,35 @@ if lineup:
             player = lineup.get(pos_name)
             if not player:
                 continue
-            name, score, team, league, primary_pos = player
             st.markdown(f"""
             <div class="pos-card" style="display:flex;justify-content:space-between;align-items:center;">
                 <div>
                     <div class="pos-card-title">{pos_name}</div>
-                    <div class="player-name">{name}</div>
-                    <div class="player-meta">{team} · {league}</div>
+                    <div class="player-name">{player['name']}</div>
+                    <div class="player-meta">{player['team']} · {player['league']}</div>
                 </div>
-                <div class="score-badge">{score}</div>
+                <div class="score-badge">{player['score']}</div>
             </div>
             """, unsafe_allow_html=True)
 
     with alt_col:
         st.markdown('<div class="section-title">Alternatif Oyuncular</div>', unsafe_allow_html=True)
-        for pos_name, scores in all_scores.items():
-            if scores and len(scores) > 1:
+        for pos_name in FORMATION_ORDER:
+            scores = all_scores.get(pos_name, [])
+            if len(scores) > 1:
+                selected_name = lineup.get(pos_name, {}).get('name', '')
                 with st.expander(f"{pos_name} alternatifleri"):
-                    alt_df = pd.DataFrame(scores[:5], columns=["Oyuncu","Skor","Takım","Lig","Pozisyon"])
+                    rows = []
+                    for d in scores[:5]:
+                        seçili = "✓" if d['name'] == selected_name else ""
+                        rows.append({
+                            "": seçili,
+                            "Oyuncu": d['name'],
+                            "Skor": d['score'],
+                            "Takım": d['team'],
+                            "Lig": d['league'],
+                        })
+                    alt_df = pd.DataFrame(rows)
                     st.dataframe(alt_df, use_container_width=True, hide_index=True)
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
